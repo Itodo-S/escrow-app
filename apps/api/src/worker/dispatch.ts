@@ -1,5 +1,6 @@
 import type { Prisma } from '@prisma/client';
 import type { Db } from '../db.js';
+import { issueUrlPrefix } from '../github/issue-url.js';
 import { parseCriteria } from '../github/criteria.js';
 import { replayUntrackedFunds } from '../indexer/replay.js';
 import { handleIssueComment, type CommandDeps, type IssueCommentPayload } from '../github/commands.js';
@@ -21,6 +22,10 @@ interface InstallationPayload {
   repositories_added?: { id: number; full_name: string; private: boolean }[];
   repositories_removed?: { id: number }[];
 }
+interface RepositoryPayload {
+  action: string;
+  repository: { id: number; full_name: string };
+}
 interface IssuesPayload {
   action: string;
   repository: { id: number };
@@ -31,12 +36,22 @@ async function upsertRepos(db: Db, installationId: bigint, repos: { id: number; 
   for (const r of repos) {
     await db.repo.upsert({
       where: { id: BigInt(r.id) },
-      create: { id: BigInt(r.id), installationId, fullName: r.full_name, private: r.private },
-      update: { installationId, fullName: r.full_name, private: r.private },
+      create: { id: BigInt(r.id), installationId, fullName: r.full_name, private: r.private, active: true },
+      update: { installationId, fullName: r.full_name, private: r.private, active: true },
     });
     // A bounty may have been funded before the app was installed on this repo.
     await replayUntrackedFunds(db, BigInt(r.id));
   }
+}
+
+/** A rename keeps the repo id, so every stored issue URL and every GitHub API call must be re-based. */
+async function renameRepo(d: DispatchDeps, p: RepositoryPayload): Promise<string> {
+  if (p.action !== 'renamed' && p.action !== 'transferred') return 'ignored';
+  const id = BigInt(p.repository.id);
+  const r = await d.db.repo.updateMany({ where: { id }, data: { fullName: p.repository.full_name } });
+  if (!r.count) return `repository.${p.action}:untracked`;
+  await d.db.$executeRaw`UPDATE "Bounty" SET "issueUrl" = ${issueUrlPrefix(p.repository.full_name)} || "issueNumber"::text WHERE "repoId" = ${id}`;
+  return `repository.${p.action}:${r.count}`;
 }
 
 /** Routes one verified webhook delivery to its handler. Unknown events are ignored, not errors. */
@@ -64,8 +79,15 @@ export async function dispatchWebhook(d: DispatchDeps, event: string, payload: u
       const id = BigInt(p.installation.id);
       await d.db.installation.upsert({ where: { id }, create: { id, accountLogin: p.installation.account.login, accountType: p.installation.account.type }, update: {} });
       await upsertRepos(d.db, id, p.repositories_added);
-      return `installation_repositories.${p.action}`;
+      const removed = (p.repositories_removed ?? []).map((r) => BigInt(r.id));
+      if (removed.length) {
+        // scoped to this installation: a repo transferred to another account is re-added by its new one
+        await d.db.repo.updateMany({ where: { id: { in: removed }, installationId: id }, data: { active: false } });
+      }
+      return `installation_repositories.${p.action}:+${p.repositories_added?.length ?? 0}/-${removed.length}`;
     }
+    case 'repository':
+      return renameRepo(d, payload as RepositoryPayload);
     case 'issue_comment': {
       const p = payload as IssueCommentPayload & { action: string };
       if (p.action !== 'created') return 'ignored';

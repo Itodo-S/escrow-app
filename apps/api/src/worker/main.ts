@@ -11,7 +11,7 @@ import { anthropicModel } from '../ai/anthropic.js';
 import { runPrReview } from '../ai/pipeline.js';
 import { createGithubClient, asPort } from '../github/client.js';
 import type { GithubPort } from '../github/commands.js';
-import { announcePayout, githubIssueCommenter, githubNotifier, refreshBountyCard } from '../github/sync.js';
+import { announcePayout, githubIssueCommenter, githubNotifier, refreshBountyCard, retryPendingRejectComments } from '../github/sync.js';
 import { dispatchWebhook } from './dispatch.js';
 import { reviewProducer, reviewWorker } from './review-queue.js';
 import { webhookWorker } from './queue.js';
@@ -76,6 +76,9 @@ else log('relayer disabled: RELAYER_SECRET not set (testnet/dev only; mainnet ne
 const reminderTimer = setInterval(() => {
   sendRefundReminders({ db, graceMs: 72 * 3600e3, webUrl: cfg.WEB_PUBLIC_URL, log, commenter: ghClient ? githubIssueCommenter({ db, gh: ghClient }) : { comment: async () => notConfigured() } })
     .catch((e) => log('reminders skipped', e instanceof Error ? e.message : String(e)));
+  // rejection follow-ups that failed to post are retried here, without touching the rejected row
+  retryPendingRejectComments({ db, commenter, log })
+    .catch((e) => log('reject comment retry skipped', e instanceof Error ? e.message : String(e)));
 }, 3600e3);
 
 // Cooldowns live in Redis (with a TTL), so a deploy or crash does not re-send every active alert.
