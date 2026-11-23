@@ -72,7 +72,20 @@ model FundingIntent {
   expiresAt    DateTime
   usedAt       DateTime?
   createdAt    DateTime  @default(now())
+  submissions  FundingSubmission[]
   @@index([repoId, issueNumber])
+}
+
+/// Binds a submitted funding transaction to the intent that authorised it. The indexer uses the
+/// tx hash to attribute a funded event, so equal-amount intents from different maintainers cannot
+/// be swapped by the fuzzy match.
+model FundingSubmission {
+  id        String        @id @default(cuid())
+  intentId  String
+  txHash    String        @unique
+  createdAt DateTime      @default(now())
+  intent    FundingIntent @relation(fields: [intentId], references: [id])
+  @@index([intentId])
 }
 
 enum BountyStatus {

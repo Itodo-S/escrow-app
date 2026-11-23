@@ -41,7 +41,7 @@ const post = (a: Awaited<ReturnType<typeof app>>, url: string, h: object, payloa
 
 beforeEach(async () => {
   calls = {}; chainStatus = 'Open'; fail = null;
-  await db.$executeRawUnsafe('TRUNCATE "Payout","PullRequestBounty","PullRequest","Bounty","FundingIntent","Repo","Installation","WalletChallenge","Session","User" CASCADE');
+  await db.$executeRawUnsafe('TRUNCATE "Payout","PullRequestBounty","PullRequest","Bounty","FundingSubmission","FundingIntent","Repo","Installation","WalletChallenge","Session","User" CASCADE');
   await db.installation.create({ data: { id: 1n, accountLogin: 'o', accountType: 'User' } });
   await db.repo.create({ data: { id: 100n, installationId: 1n, fullName: 'o/r', private: false } });
 });
@@ -101,6 +101,18 @@ describe('POST /tx/submit', () => {
     expect((await post(a, '/tx/submit', h, { xdr: 'BADXDRBADXDR' })).statusCode).toBe(422);
     expect((await post(a, '/tx/submit', h, {})).statusCode).toBe(400);
     expect((await a.inject({ method: 'POST', url: '/tx/submit', payload: { xdr: 'AAAAAAAAAAAAAAA' } })).statusCode).toBe(401);
+  });
+  it('records {intentId, txHash} at submit time so the indexer can bind by hash', async () => {
+    await intent();
+    const { a, h } = await login(1n);
+    expect((await post(a, '/tx/submit', h, { xdr: 'AAAAAAAAAAAAAAA', address: MAINT, intentId: 'intent-abcdefghij' })).json()).toEqual({ hash: 'HASH' });
+    expect(await db.fundingSubmission.findUniqueOrThrow({ where: { txHash: 'HASH' } })).toMatchObject({ intentId: 'intent-abcdefghij' });
+  });
+  it('will not bind a submission to an intent owned by another GitHub user', async () => {
+    await intent();
+    const other = await login(2n);
+    expect((await post(other.a, '/tx/submit', other.h, { xdr: 'AAAAAAAAAAAAAAA', intentId: 'intent-abcdefghij' })).json().error.code).toBe('not_requester');
+    expect(await db.fundingSubmission.count()).toBe(0);
   });
 });
 

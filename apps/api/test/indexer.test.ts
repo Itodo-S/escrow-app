@@ -120,4 +120,27 @@ describe('applyEvent', () => {
     await run({ kind: 'released', id: 1n, winner: w, net: 970n, fee: 30n, caller: w }, 2);
     expect((await db.payout.findUniqueOrThrow({ where: { idempotencyKey: 'release:1' } })).status).toBe('CONFIRMED');
   });
+
+  it('attributes a funded event to the tx-bound intent, not a newer equal-amount one', async () => {
+    const first = { repoId: 100n, issueNumber: 7, token: 'CTOKEN', amount: '1000', durationDays: 7, commentId: 1n, expiresAt: new Date(Date.now() + 1e6) };
+    await db.fundingIntent.create({ data: { ...first, id: 'older', requestedBy: 11n, createdAt: new Date('2026-01-01') } });
+    await db.fundingIntent.create({ data: { ...first, id: 'newer', requestedBy: 22n, createdAt: new Date('2026-02-01') } });
+    await db.fundingSubmission.create({ data: { intentId: 'older', txHash: 'tx1' } });
+    const warnings: string[] = [];
+    await db.$transaction((tx) => applyEvent(tx, funded(), { ...meta(1), log: (m) => warnings.push(m) }));
+
+    expect((await db.bounty.findUniqueOrThrow({ where: { id: 1n } })).maintainerGithubId).toBe(11n);
+    expect((await db.fundingIntent.findUniqueOrThrow({ where: { id: 'older' } })).usedAt).not.toBeNull();
+    expect((await db.fundingIntent.findUniqueOrThrow({ where: { id: 'newer' } })).usedAt).toBeNull();
+    expect(warnings).toEqual([]);
+  });
+
+  it('uses the fuzzy match only as a fallback, with a logged warning', async () => {
+    await db.fundingIntent.create({ data: { id: 'i1', repoId: 100n, issueNumber: 7, requestedBy: 55n, token: 'CTOKEN', amount: '1000', durationDays: 7, commentId: 1n, expiresAt: new Date(Date.now() + 1e6) } });
+    const warnings: string[] = [];
+    await db.$transaction((tx) => applyEvent(tx, funded(), { ...meta(1), log: (m) => warnings.push(m) }));
+
+    expect((await db.bounty.findUniqueOrThrow({ where: { id: 1n } })).maintainerGithubId).toBe(55n);
+    expect(warnings.join('|')).toContain('fuzzily');
+  });
 });

@@ -18,6 +18,7 @@ export interface FundingDeps {
   db: Db;
   chain: FundingChain;
   now?: () => Date;
+  log?: (msg: string, extra?: unknown) => void;
 }
 
 type Authed = FastifyRequest & { user?: { id: string; githubId: bigint; wallet: string | null } };
@@ -70,12 +71,35 @@ export function registerFunding(app: FastifyInstance, d: FundingDeps, authed: (m
   });
 
   /** Relays a signed single-operation contract call. Never trusts client claims about the result. */
-  const submit = z.object({ xdr: z.string().min(10).max(20_000), address: z.string().optional() });
+  const submit = z.object({ xdr: z.string().min(10).max(20_000), address: z.string().optional(), intentId: z.string().optional() });
   app.post('/tx/submit', { ...authed(true), ...limit }, async (req, reply) => {
     const body = submit.safeParse(req.body);
     if (!body.success) return err(reply, 400, 'bad_request', 'xdr required');
-    try { return { hash: await d.chain.submitSigned(body.data.xdr, body.data.address) }; }
+    // The client tells us which funding link it signed for. Only the link's owner can bind a
+    // submission to it; otherwise a stray intentId could attribute someone else's bounty to them.
+    let intent: { id: string } | undefined;
+    if (body.data.intentId) {
+      const i = await d.db.fundingIntent.findUnique({ where: { id: body.data.intentId }, select: { id: true, requestedBy: true, expiresAt: true, usedAt: true } });
+      if (!i || i.requestedBy !== (req as Authed).user!.githubId || state(i) !== 'open') {
+        return err(reply, 403, 'not_requester', 'this link belongs to another GitHub user');
+      }
+      intent = { id: i.id };
+    }
+    let hash: string;
+    try { hash = await d.chain.submitSigned(body.data.xdr, body.data.address); }
     catch (e) { return err(reply, 422, 'submit_rejected', e instanceof Error ? e.message.slice(0, 200) : 'rejected'); }
+    // Bind after the chain accepts the tx. Best effort: the indexer falls back to a fuzzy match
+    // (with a warning) if the binding is missing. Never fail a successful submission over this.
+    if (intent) {
+      try {
+        await d.db.fundingSubmission.upsert({
+          where: { txHash: hash },
+          create: { intentId: intent.id, txHash: hash },
+          update: { intentId: intent.id },
+        });
+      } catch (e) { d.log?.('funding submission binding failed', e instanceof Error ? e.message : String(e)); }
+    }
+    return { hash };
   });
 
   // ---- maintainer self-release and refund ----

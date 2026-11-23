@@ -1,3 +1,4 @@
+import type { Prisma } from '@prisma/client';
 import type { Db } from '../db.js';
 import { parseCriteria } from '../github/criteria.js';
 import { replayUntrackedFunds } from '../indexer/replay.js';
@@ -8,6 +9,8 @@ export interface DispatchDeps {
   db: Db;
   commands: CommandDeps;
   pulls: PullDeps;
+  /** Re-renders a bounty's GitHub card after the issue changes (wired in worker/main.ts). */
+  refreshCard: (bountyId: bigint) => Promise<unknown>;
   log?: (msg: string, extra?: unknown) => void;
 }
 
@@ -75,11 +78,21 @@ export async function dispatchWebhook(d: DispatchDeps, event: string, payload: u
     case 'issues': {
       const p = payload as IssuesPayload;
       if (p.action !== 'edited') return 'ignored';
-      const r = await d.db.bounty.updateMany({
-        where: { repoId: BigInt(p.repository.id), issueNumber: p.issue.number, status: { in: ['OPEN', 'DISPUTED'] } },
-        data: { issueTitle: p.issue.title, criteria: parseCriteria(p.issue.body) },
-      });
-      return `issues.edited:${r.count}`;
+      const where: Prisma.BountyWhereInput = { repoId: BigInt(p.repository.id), issueNumber: p.issue.number, status: { in: ['OPEN', 'DISPUTED'] } };
+      const affected = await d.db.bounty.findMany({ where, select: { id: true } });
+      if (affected.length) {
+        await d.db.bounty.updateMany({
+          where: { id: { in: affected.map((b) => b.id) } },
+          data: { issueTitle: p.issue.title, criteria: parseCriteria(p.issue.body) },
+        });
+        // The DB now has the new title/criteria; push them to the card immediately instead of
+        // waiting for the next chain event. A failure on one bounty must not block the others.
+        for (const b of affected) {
+          try { await d.refreshCard(b.id); }
+          catch (e) { d.log?.('card refresh after issue edit failed', { bountyId: String(b.id), error: e instanceof Error ? e.message : String(e) }); }
+        }
+      }
+      return `issues.edited:${affected.length}`;
     }
     default:
       return 'ignored';

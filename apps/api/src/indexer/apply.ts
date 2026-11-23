@@ -5,6 +5,7 @@ export interface EventMeta {
   eventId: string;
   txHash: string;
   closedAt: Date;
+  log?: (msg: string, extra?: unknown) => void;
 }
 
 export type Outcome = 'applied' | 'stale' | 'untracked' | 'anomaly';
@@ -52,10 +53,27 @@ export async function applyEvent(tx: Prisma.TransactionClient, ev: ChainEvent, m
     const existing = await tx.bounty.findUnique({ where: { id: ev.id } });
     if (existing) return existing.lastEventId && existing.lastEventId >= meta.eventId ? 'stale' : 'anomaly';
     const issueNumber = Number(ev.issue);
-    const intent = await tx.fundingIntent.findFirst({
-      where: { repoId: ev.repoId, issueNumber, usedAt: null, amount: ev.amount.toString(), token: ev.token },
-      orderBy: { createdAt: 'desc' },
-    });
+    // A submission recorded at /tx/submit binds this exact tx to its intent. Match on it first:
+    // two equal-amount intents (e.g. from different maintainers) are interchangeable to the old
+    // fuzzy match, which could attribute the bounty to the wrong GitHub user.
+    let intent: { id: string; requestedBy: bigint; repoId: bigint; issueNumber: number; amount: { toString(): string }; token: string } | null = null;
+    const bound = await tx.fundingSubmission.findUnique({ where: { txHash: meta.txHash }, include: { intent: true } });
+    const bindingFits = bound && bound.intent.usedAt === null && bound.intent.repoId === ev.repoId
+      && bound.intent.issueNumber === issueNumber && bound.intent.amount.toString() === ev.amount.toString()
+      && bound.intent.token === ev.token;
+    if (bound && bindingFits) {
+      intent = bound.intent;
+    } else if (bound) {
+      meta.log?.('funding submission does not match the funded event; ignoring binding', { txHash: meta.txHash, intentId: bound.intentId, eventId: meta.eventId });
+    }
+    if (!intent) {
+      // Fallback only (older funding links / direct on-chain funding): ambiguous by design.
+      intent = await tx.fundingIntent.findFirst({
+        where: { repoId: ev.repoId, issueNumber, usedAt: null, amount: ev.amount.toString(), token: ev.token },
+        orderBy: { createdAt: 'desc' },
+      });
+      if (intent) meta.log?.('funding intent matched fuzzily (no tx binding)', { txHash: meta.txHash, intentId: intent.id, eventId: meta.eventId });
+    }
     if (intent) await tx.fundingIntent.update({ where: { id: intent.id }, data: { usedAt: meta.closedAt } });
     await tx.bounty.create({
       data: {

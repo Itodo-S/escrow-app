@@ -111,7 +111,7 @@ export async function pollOnce(d: IndexerDeps, startLedgerFallback?: number): Pr
         const ev = decodeEvent(raw);
         ledger = Math.max(ledger, raw.ledger);
         if (!ev) continue;
-        const out: Outcome = await applyEvent(tx, ev, { eventId: raw.id, txHash: raw.txHash, closedAt: new Date(raw.ledgerClosedAt) });
+        const out: Outcome = await applyEvent(tx, ev, { eventId: raw.id, txHash: raw.txHash, closedAt: new Date(raw.ledgerClosedAt), log: d.log });
         if (out === 'anomaly') d.log?.('anomalous event ignored', { id: raw.id, kind: ev.kind });
         if (out === 'applied') applied.push({ bountyId: ev.id, kind: ev.kind });
       }

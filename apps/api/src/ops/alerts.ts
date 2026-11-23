@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { Db } from '../db.js';
 import { DISPUTE_REVIEW_HOURS } from '../disputes.js';
 
@@ -44,11 +45,48 @@ export async function collectAlerts(a: AlertInputs): Promise<string[]> {
 /** Sends alerts to the webhook, at most once per message per cooldown. */
 export function alertSender(url: string | undefined, log: (m: string, x?: unknown) => void, cooldownMs = HOUR_MS, fetchImpl: typeof fetch = fetch) {
   const sent = new Map<string, number>();
+  return {
+    async claim(message, now, cooldownMs) {
+      const last = sent.get(message);
+      if (last !== undefined && last + cooldownMs > now) return false;
+      sent.set(message, now);
+      return true;
+    },
+  };
+}
+
+/** Minimal slice of ioredis we need (keeps the alert code easy to fake in tests). */
+export interface RedisCooldownClient {
+  set(key: string, value: string, mode: 'EX', ttlSeconds: number, condition: 'NX'): Promise<string | null>;
+}
+
+/**
+ * Persists the last-sent timestamp in Redis under a per-message key with a TTL equal to the
+ * cooldown. SET .. NX makes the claim atomic, so two workers cannot both send the same alert.
+ * The key is hashed so arbitrary alert text cannot produce an invalid/oversized Redis key.
+ */
+export function redisCooldown(redis: RedisCooldownClient): AlertCooldownStore {
+  return {
+    async claim(message, now, cooldownMs) {
+      const key = `alerts:cooldown:${createHash('sha256').update(message).digest('hex')}`;
+      const ttlSeconds = Math.max(1, Math.ceil(cooldownMs / 1000));
+      const res = await redis.set(key, String(now), 'EX', ttlSeconds, 'NX');
+      return res === 'OK';
+    },
+  };
+}
+
+/** Sends alerts to the webhook, at most once per message per cooldown. */
+export function alertSender(
+  url: string | undefined,
+  log: (m: string, x?: unknown) => void,
+  cooldownMs = HOURS,
+  fetchImpl: typeof fetch = fetch,
+  store: AlertCooldownStore = memoryCooldown(),
+) {
   return async (messages: string[], now = Date.now()) => {
     for (const m of messages) {
-      const last = sent.get(m);
-      if (last !== undefined && last + cooldownMs > now) continue;
-      sent.set(m, now);
+      if (!await store.claim(m, now, cooldownMs)) continue;
       log('ALERT', m);
       if (url) await fetchImpl(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text: `SkillEscrow: ${m}` }) }).catch(() => {});
     }

@@ -11,6 +11,15 @@ afterAll(() => db.$disconnect());
 const REDIS = process.env.TEST_REDIS_URL ?? 'redis://localhost:6379/1';
 
 let comments: string[];
+let cardUpdates: string[];
+// Fake GitHub API for card refreshes. getIssue fails on purpose: the refreshed card must be
+// rendered from the criteria the issues.edited handler just wrote to the DB.
+const gh: GithubApi = {
+  getIssue: async () => { throw new Error('issue fetch unavailable'); },
+  postComment: async () => 555n,
+  updateComment: async (_i, _r, _id, body) => void cardUpdates.push(body),
+  setBountyLabel: async () => {},
+};
 const deps = (): DispatchDeps => ({
   db,
   commands: {
@@ -19,6 +28,7 @@ const deps = (): DispatchDeps => ({
     gh: { getPermission: async () => 'write', postComment: async (_i, _r, _n, b) => (comments.push(b), 1n) },
   },
   pulls: { db, webUrl: 'https://app.test', chain: { getBounty: async () => ({ status: 'Open', relayerAllowed: true, maintainer: 'GM' }) }, notifier: { notify: async () => {} } },
+  refreshCard: async (bountyId) => { await refreshBountyCard({ db, gh, webUrl: 'https://app.test', symbolFor: () => 'USDC' }, bountyId); },
 });
 
 beforeEach(async () => {

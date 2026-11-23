@@ -1,8 +1,9 @@
+import { Redis } from 'ioredis';
 import { loadConfig, loadDotEnv } from '../config.js';
 import { createChain } from '../chain/client.js';
 import { createDb } from '../db.js';
 import { run as runIndexer } from '../indexer/indexer.js';
-import { alertSender, collectAlerts } from '../ops/alerts.js';
+import { alertSender, collectAlerts, ALERT_COOLDOWN_MS, redisCooldown } from '../ops/alerts.js';
 import { sendRefundReminders } from '../ops/reminders.js';
 import { runRelayer } from '../payouts/loop.js';
 import { createRelayer } from '../payouts/relayer.js';
@@ -33,6 +34,8 @@ const usdc = cfg.TOKEN_USDC_CONTRACT_ID;
 const xlm = cfg.TOKEN_XLM_CONTRACT_ID;
 const limits = { min: 10_000_000n, max: 5_000_000_000n };
 const symbolFor = (t: string) => (t === usdc ? 'USDC' : t === xlm ? 'XLM' : `${t.slice(0, 4)}…`);
+// Shared GitHub sync deps: used both by chain events and by webhook-driven card refreshes.
+const sync = ghClient ? { db, gh: ghClient, webUrl: cfg.WEB_PUBLIC_URL, symbolFor, log } : null;
 // AI review: needs the GitHub App (to read PRs and comment) and an Anthropic key. Off otherwise.
 const reviewsOn = Boolean(ghClient && cfg.ANTHROPIC_API_KEY);
 const reviews = reviewsOn ? reviewProducer(cfg.REDIS_URL) : null;
@@ -45,6 +48,10 @@ const deps = {
     db, webUrl: cfg.WEB_PUBLIC_URL, ...(reviews ? { reviewTrigger: (id: bigint) => void reviews.schedule(id).catch((e) => log('review schedule failed', e instanceof Error ? e.message : String(e))) } : {}),
     chain: { getBounty: async (id: bigint) => { const b = await chain.getBounty(id); return { status: b.status.tag, relayerAllowed: b.relayer_allowed, maintainer: b.maintainer, winner: b.winner ?? null }; } },
     notifier: ghClient ? githubNotifier({ db, gh: ghClient }) : { notify: async (b: bigint, pr: number, m: string) => log('notify skipped (GitHub App not configured)', { b: String(b), pr, m }) },
+  },
+  refreshCard: async (bountyId: bigint) => {
+    if (!sync) return log('card refresh skipped (GitHub App not configured)', { bounty: String(bountyId) });
+    await refreshBountyCard(sync, bountyId);
   },
   log,
 };
@@ -71,7 +78,9 @@ const reminderTimer = setInterval(() => {
     .catch((e) => log('reminders skipped', e instanceof Error ? e.message : String(e)));
 }, 3600e3);
 
-const send = alertSender(cfg.ALERT_WEBHOOK_URL, log);
+// Cooldowns live in Redis (with a TTL), so a deploy or crash does not re-send every active alert.
+const cooldownRedis = new Redis(cfg.REDIS_URL, { maxRetriesPerRequest: null });
+const send = alertSender(cfg.ALERT_WEBHOOK_URL, log, ALERT_COOLDOWN_MS, fetch, redisCooldown(cooldownRedis));
 const alertTimer = setInterval(async () => {
   try {
     const [balance, latest] = await Promise.all([relayer?.balanceXlm().catch(() => undefined), chain.server.getLatestLedger().then((l) => l.sequence).catch(() => undefined)]);
@@ -81,9 +90,8 @@ const alertTimer = setInterval(async () => {
 const w = webhookWorker(cfg.REDIS_URL, async (job) => log('webhook handled', { id: job.id, event: job.event, result: await dispatchWebhook(deps as never, job.event, job.payload) }));
 w.worker.on('failed', (j, e) => log('webhook job failed', { id: j?.id, error: e.message }));
 // every chain event for a bounty refreshes its GitHub card (best effort; the chain is the truth)
-const onApplied = ghClient
+const onApplied = sync
   ? ({ bountyId, kind }: { bountyId: bigint; kind: string }) => {
-      const sync = { db, gh: ghClient, webUrl: cfg.WEB_PUBLIC_URL, symbolFor, log };
       const fail = (what: string) => (e: unknown) => log(`${what} failed`, e instanceof Error ? e.message : String(e));
       if (kind === 'released') void announcePayout({ ...sync, explorerTx: (h) => cfg.EXPLORER_TX_URL_TEMPLATE.replace('{hash}', encodeURIComponent(h)) }, bountyId).catch(fail('payout announcement'));
       void refreshBountyCard(sync, bountyId).catch(fail('card refresh'));

@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import { createDb } from '../src/db.js';
-import { alertSender, collectAlerts } from '../src/ops/alerts.js';
+import { alertSender, collectAlerts, redisCooldown } from '../src/ops/alerts.js';
 import { loadConfig } from '../src/config.js';
 
 const db = createDb(process.env.TEST_DATABASE_URL ?? 'postgresql://skillescrow:skillescrow@localhost:5432/skillescrow_test');
@@ -46,6 +46,35 @@ describe('alertSender', () => {
     const send = alertSender('https://hook.test', () => {}, 1000, f);
     await send(['a', 'b'], 0); await send(['a'], 500); await send(['a'], 1500);
     expect(posts).toHaveLength(3);
+  });
+});
+
+describe('alertSender cooldown persistence', () => {
+  it('does not resend after a restart inside the cooldown; resends once it expires', async () => {
+    const posts: string[] = [];
+    const f = (async (_u: string, init: { body: string }) => (posts.push(init.body), new Response())) as unknown as typeof fetch;
+    // Fake Redis with a controllable clock and TTL semantics (SET key value EX ttl NX).
+    let clock = 1_000_000;
+    const data = new Map<string, { expiresAt: number }>();
+    const redis = {
+      set: async (key: string, _value: string, mode: 'EX', ttl: number, nx: 'NX') => {
+        if (mode !== 'EX' || nx !== 'NX') throw new Error('unexpected SET');
+        const current = data.get(key);
+        if (current && current.expiresAt > clock) return null;
+        data.set(key, { expiresAt: clock + ttl * 1000 });
+        return 'OK';
+      },
+    };
+    // Each call builds a fresh sender: the only shared state is the Redis store.
+    const make = () => alertSender('https://hook.test', () => {}, 1000, f, redisCooldown(redis));
+
+    await make()(['disk full'], clock);
+    await make()(['disk full'], clock + 500); // simulated restart mid-cooldown
+    expect(posts).toHaveLength(1);
+
+    clock += 1001;
+    await make()(['disk full'], clock); // TTL elapsed
+    expect(posts).toHaveLength(2);
   });
 });
 
