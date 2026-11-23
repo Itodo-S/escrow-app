@@ -11,22 +11,25 @@ export interface EventMeta {
 
 export type Outcome = 'applied' | 'stale' | 'untracked' | 'anomaly';
 
-type ResolvedEvent = Extract<ChainEvent, { kind: 'resolved' }>;
+type FundedEvent = Extract<ChainEvent, { kind: 'funded' }>;
+const BIGINT_TAG = '__bigint__';
 
-/** An on-chain resolve matches a stored proposal only when both the winner and the exact split agree. */
-function proposalMatches(
-  proposal: { pendingWinner: string | null; pendingWinnerBps: number | null },
-  amount: bigint,
-  ev: ResolvedEvent,
-): boolean {
-  if (proposal.pendingWinnerBps === null) return false;
-  const bps = proposal.pendingWinnerBps;
-  const expectedWinner = bps > 0 ? proposal.pendingWinner : null;
-  if ((ev.winner ?? null) !== expectedWinner) return false;
-  // the protocol fee is split-independent, so the winner's share is portion(spendable, bps)
-  const spendable = amount - ev.fee;
-  const expectedNet = bps > 0 ? portion(spendable, bps) : 0n;
-  return ev.winnerNet === expectedNet;
+/** JSON cannot represent bigints; tag them so a stored event round-trips exactly. */
+const toJson = (_key: string, value: unknown) =>
+  typeof value === 'bigint' ? { [BIGINT_TAG]: value.toString() } : value;
+const fromJson = (_key: string, value: unknown) =>
+  value && typeof value === 'object' && !Array.isArray(value) && BIGINT_TAG in value
+    ? BigInt((value as Record<string, string>)[BIGINT_TAG]!)
+    : value;
+
+/** Serialize an untracked funded event together with the cursor metadata needed to replay it. */
+export function encodeFundEvent(ev: FundedEvent, meta: EventMeta): string {
+  return JSON.stringify({ ev, meta }, toJson);
+}
+
+export function decodeFundEvent(payload: string): { ev: FundedEvent; meta: EventMeta } {
+  const parsed = JSON.parse(payload, fromJson) as { ev: FundedEvent; meta: Omit<EventMeta, 'closedAt'> & { closedAt: string } };
+  return { ev: parsed.ev, meta: { ...parsed.meta, closedAt: new Date(parsed.meta.closedAt) } };
 }
 
 /**
@@ -37,7 +40,17 @@ function proposalMatches(
 export async function applyEvent(tx: Prisma.TransactionClient, ev: ChainEvent, meta: EventMeta): Promise<Outcome> {
   if (ev.kind === 'funded') {
     const repo = await tx.repo.findUnique({ where: { id: ev.repoId } });
-    if (!repo) return 'untracked'; // anyone can fund any repo on-chain; we only track installed ones
+    if (!repo) {
+      // anyone can fund any repo on-chain; we only track installed ones. Keep the event so a
+      // later installation can replay it — the cursor will not revisit it.
+      const payload = encodeFundEvent(ev, meta);
+      await tx.untrackedFundEvent.upsert({
+        where: { id: ev.id },
+        create: { id: ev.id, repoId: ev.repoId, payload },
+        update: { payload },
+      });
+      return 'untracked';
+    }
     const existing = await tx.bounty.findUnique({ where: { id: ev.id } });
     if (existing) return existing.lastEventId && existing.lastEventId >= meta.eventId ? 'stale' : 'anomaly';
     const issueNumber = Number(ev.issue);

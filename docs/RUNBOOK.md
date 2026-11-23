@@ -56,8 +56,14 @@
 ### <a id="alert-indexer-lag"></a>`Indexer is <N> ledgers behind`
 - **What it means:** `latestLedger - IndexerCursor.ledger > 60` (~5 minutes behind chain tip).
 - **Likely causes:** Worker process stopped/crashed, Stellar RPC rate limiting or downtime, or cursor fell outside RPC retention.
-- **First actions:** Check worker logs and RPC health (`GET /health`). Restart the worker if stopped; if cursor is outside retention, delete `IndexerCursor` or run reindex.
+- **First actions:** Check worker logs and RPC health (`GET /health`). Restart the worker if stopped; if the cursor is outside retention, the indexer replays from the last stored ledger and alerts with the skipped ledger gap (see below).
 - **When to escalate:** If lag continues growing despite a healthy worker and reachable RPC.
+
+### <a id="alert-indexer-retention-gap"></a>`Indexer skipped <N> ledger(s) (<from> → <to>) outside RPC retention`
+- **What it means:** The stored cursor and its ledger are both older than the RPC's retained window, so events in that range are missing from the DB cache. An `indexer.retention_gap` audit-log entry records the exact gap.
+- **Likely causes:** Worker/RPC downtime longer than the RPC retention window, or a cursor left untouched for too long.
+- **First actions:** Run `pnpm reindex --from-ledger <from>` from the `from` ledger in the alert to rebuild the cache from events. Verify the indexer cursor ledger catches up to the chain tip.
+- **When to escalate:** If the gap contains bounty state changes that cannot be replayed (RPC no longer retains them) or if reindex cannot recover the range.
 
 ### <a id="alert-disputes-overdue"></a>`<N> dispute(s) older than 36 h`
 - **What it means:** One or more disputes in `requested` or `opened_onchain` state have been open for over 36 hours.

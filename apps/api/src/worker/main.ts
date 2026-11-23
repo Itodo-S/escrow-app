@@ -67,8 +67,7 @@ else log('relayer disabled: RELAYER_SECRET not set (testnet/dev only; mainnet ne
 
 // Reminders are real issue comments when GitHub is configured; otherwise they fail without being marked as sent.
 const reminderTimer = setInterval(() => {
-  const commenter = ghClient ? githubIssueCommenter({ db, gh: ghClient }) : { comment: async () => notConfigured() };
-  sendRefundReminders({ db, graceMs: 72 * 3600e3, webUrl: cfg.WEB_PUBLIC_URL, commenter })
+  sendRefundReminders({ db, graceMs: 72 * 3600e3, webUrl: cfg.WEB_PUBLIC_URL, log, commenter: ghClient ? githubIssueCommenter({ db, gh: ghClient }) : { comment: async () => notConfigured() } })
     .catch((e) => log('reminders skipped', e instanceof Error ? e.message : String(e)));
   // rejection follow-ups that failed to post are retried here, without touching the rejected row
   retryPendingRejectComments({ db, commenter, log })
@@ -93,6 +92,6 @@ const onApplied = ghClient
       void refreshBountyCard(sync, bountyId).catch(fail('card refresh'));
     }
   : undefined;
-void runIndexer({ db, server: chain.server, contractId: cfg.BOUNTY_CONTRACT_ID, log, ...(onApplied ? { onApplied } : {}) }, ac.signal);
+void runIndexer({ db, server: chain.server, contractId: cfg.BOUNTY_CONTRACT_ID, log, onAlert: (m) => void send([m]), ...(onApplied ? { onApplied } : {}) }, ac.signal);
 for (const s of ['SIGINT', 'SIGTERM'] as const) process.on(s, () => { ac.abort(); clearInterval(alertTimer); clearInterval(reminderTimer); void Promise.all([w.close(), reviewConsumer?.close(), reviews?.close()]).then(() => process.exit(0)); });
 log('worker started');

@@ -176,9 +176,12 @@ model Payout {
   idempotencyKey String       @unique
   txHash         String?
   attempts       Int          @default(0)
+  /** When a transient failure may be retried; persisted so a restart does not reset backoff. */
+  nextAttemptAt  DateTime?
   lastError      String?
   createdAt      DateTime     @default(now())
   updatedAt      DateTime     @updatedAt
+  @@index([nextAttemptAt])
 }
 
 model Dispute {
@@ -214,6 +217,16 @@ model IndexerCursor {
   cursor    String?
   ledger    Int
   updatedAt DateTime @updatedAt
+}
+
+/// A funded event for a repo we do not track yet. Kept so a late installation can replay it
+/// instead of losing the bounty when the cursor has already moved past the event.
+model UntrackedFundEvent {
+  id        BigInt   @id // bounty id from the fund event
+  repoId    BigInt
+  payload   String   // serialized ChainEvent + EventMeta (bigints tagged so JSON round-trips)
+  createdAt DateTime @default(now())
+  @@index([repoId])
 }
 
 model AuditLog {
