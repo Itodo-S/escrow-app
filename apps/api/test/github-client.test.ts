@@ -146,16 +146,38 @@ describe('calls', () => {
     expect(all.map((r) => r.id)).toEqual(Array.from({ length: 105 }, (_, i) => i + 1));
     expect(g.calls.filter((x) => x.path.startsWith('/installation/repositories?'))).toHaveLength(2);
   });
-  it('reads PR files across pages and summarises CI', async () => {
+  it('reads PR files across pages and combines check runs with commit statuses', async () => {
     const g = fakeGithub();
     const page = (n: number) => Array.from({ length: n }, (_, i) => ({ filename: `f${i}`, additions: 1, deletions: 0, patch: '+x' }));
     g.routes['GET /repos/o/r/pulls/3/files'] = (c) => ({ status: 200, json: new URLSearchParams(c.path.split('?')[1]).get('page') === '1' ? page(100) : page(5) });
     expect(await make(g).getPullFiles(9n, 'o/r', 3)).toHaveLength(105);
-    const ci = (runs: object[]) => { g.routes['GET /repos/o/r/commits/abc1234/check-runs'] = () => ({ status: 200, json: { check_runs: runs } }); return make(g).getCiConclusion(9n, 'o/r', 'abc1234'); };
-    expect(await ci([])).toBe('none');
-    expect(await ci([{ status: 'completed', conclusion: 'success' }, { status: 'completed', conclusion: 'skipped' }])).toBe('success');
-    expect(await ci([{ status: 'in_progress', conclusion: null }])).toBe('pending');
-    expect(await ci([{ status: 'completed', conclusion: 'success' }, { status: 'completed', conclusion: 'failure' }])).toBe('failure');
+    const checks = (runs: object[]) => { g.routes['GET /repos/o/r/commits/abc1234/check-runs'] = (c) => {
+      const pageNumber = Number(new URLSearchParams(c.path.split('?')[1]).get('page'));
+      return { status: 200, json: { total_count: runs.length, check_runs: pageNumber === 1 ? runs : [] } };
+    }; };
+    const status = (state: string, total_count = 1) => { g.routes['GET /repos/o/r/commits/abc1234/status'] = () => ({ status: 200, json: { state, total_count } }); };
+    checks([]); status('success', 0);
+    expect(await make(g).getCiConclusion(9n, 'o/r', 'abc1234')).toBe('none');
+    status('pending');
+    expect(await make(g).getCiConclusion(9n, 'o/r', 'abc1234')).toBe('pending');
+    checks([{ status: 'completed', conclusion: 'success' }, { status: 'completed', conclusion: 'skipped' }]); status('success', 0);
+    expect(await make(g).getCiConclusion(9n, 'o/r', 'abc1234')).toBe('success');
+    checks([{ status: 'in_progress', conclusion: null }]); status('success');
+    expect(await make(g).getCiConclusion(9n, 'o/r', 'abc1234')).toBe('pending');
+    checks([{ status: 'completed', conclusion: 'success' }]); status('failure');
+    expect(await make(g).getCiConclusion(9n, 'o/r', 'abc1234')).toBe('failure');
+    checks([{ status: 'completed', conclusion: 'failure' }]); status('pending');
+    expect(await make(g).getCiConclusion(9n, 'o/r', 'abc1234')).toBe('failure');
+    checks(Array.from({ length: 101 }, () => ({ status: 'completed', conclusion: 'success' }))); status('success', 0);
+    g.routes['GET /repos/o/r/commits/abc1234/check-runs'] = (c) => {
+      const pageNumber = Number(new URLSearchParams(c.path.split('?')[1]).get('page'));
+      return { status: 200, json: { total_count: 101, check_runs: pageNumber === 1 ? Array.from({ length: 100 }, () => ({ status: 'completed', conclusion: 'success' })) : [{ status: 'completed', conclusion: 'success' }] } };
+    };
+    expect(await make(g).getCiConclusion(9n, 'o/r', 'abc1234')).toBe('success');
+    expect(g.calls.filter((x) => x.path.includes('/check-runs?')).slice(-2).map((x) => x.path)).toEqual([
+      '/repos/o/r/commits/abc1234/check-runs?per_page=100&page=1',
+      '/repos/o/r/commits/abc1234/check-runs?per_page=100&page=2',
+    ]);
   });
 });
 

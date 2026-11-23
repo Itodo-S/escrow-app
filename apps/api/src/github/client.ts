@@ -169,13 +169,34 @@ export function createGithubClient(cfg: GithubClientConfig) {
         installation, 'GET', `/repos/${repoOk(repo)}/pulls/${positive(pr, 'pull request')}`);
     },
 
-    /** Overall CI result for a commit from its check runs. */
+    /** Overall CI result from check runs and commit statuses. */
     async getCiConclusion(installation: bigint, repo: string, sha: string): Promise<'success' | 'failure' | 'pending' | 'none'> {
       if (!SHA.test(sha)) throw new Error('invalid sha');
-      const j = await json<{ check_runs: { status: string; conclusion: string | null }[] }>(installation, 'GET', `/repos/${repoOk(repo)}/commits/${sha}/check-runs?per_page=100`);
-      if (j.check_runs.length === 0) return 'none';
-      if (j.check_runs.some((c) => c.status !== 'completed')) return 'pending';
-      return j.check_runs.every((c) => c.conclusion === 'success' || c.conclusion === 'neutral' || c.conclusion === 'skipped') ? 'success' : 'failure';
+      const basePath = `/repos/${repoOk(repo)}/commits/${sha}`;
+      const checks = (async () => {
+        const out: { status: string; conclusion: string | null }[] = [];
+        for (let page = 1; ; page++) {
+          const j = await json<{ total_count?: number; check_runs: typeof out }>(
+            installation, 'GET', `${basePath}/check-runs?per_page=100&page=${page}`,
+          );
+          out.push(...j.check_runs);
+          const hasMore = j.total_count === undefined ? j.check_runs.length === 100 : out.length < j.total_count;
+          if (!hasMore) break;
+          if (j.check_runs.length === 0) throw new Error('incomplete check runs response');
+        }
+        return out;
+      })();
+      const [runs, status] = await Promise.all([
+        checks,
+        json<{ state: string; total_count: number }>(installation, 'GET', `${basePath}/status`),
+      ]);
+      const failure = runs.some((c) => c.status === 'completed' && !['success', 'neutral', 'skipped'].includes(c.conclusion ?? ''));
+      const pending = runs.some((c) => c.status !== 'completed');
+      const hasStatus = status.total_count > 0;
+      if (failure || (hasStatus && (status.state === 'failure' || status.state === 'error'))) return 'failure';
+      if (pending || (hasStatus && status.state === 'pending')) return 'pending';
+      if (runs.length > 0 || (hasStatus && status.state === 'success')) return 'success';
+      return 'none';
     },
 
     async getReadmeExcerpt(installation: bigint, repo: string, max = 2000): Promise<string> {

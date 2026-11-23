@@ -1,9 +1,9 @@
 import { StrKey } from '@stellar/stellar-sdk';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { contractErrorName } from '../chain/errors.js';
 import type { Db } from '../db.js';
 import { DISPUTE_REVIEW_HOURS } from '../disputes.js';
+import { chainError, err, ser, type Authed } from './http.js';
 import { mutationLimit } from './limits.js';
 
 export interface AdminChain {
@@ -20,10 +20,6 @@ export interface AdminDeps {
   /** GitHub user ids with admin rights, derived from current config on every request. */
   adminGithubIds: bigint[];
 }
-
-type Authed = FastifyRequest & { user?: { id: string; githubId: bigint; isAdmin: boolean } };
-const err = (r: FastifyReply, status: number, code: string, message: string) => r.code(status).send({ error: { code, message } });
-const ser = (v: unknown): unknown => JSON.parse(JSON.stringify(v, (_, x) => (typeof x === 'bigint' ? x.toString() : x)));
 
 export function registerAdmin(app: FastifyInstance, d: AdminDeps, authed: (mutating: boolean) => object) {
   const now = () => (d.now ?? (() => new Date()))();
@@ -54,11 +50,6 @@ export function registerAdmin(app: FastifyInstance, d: AdminDeps, authed: (mutat
     const x = await d.db.dispute.findUnique({ where: { id } });
     return x ?? void err(reply, 404, 'not_found', 'dispute not found');
   }
-  const mapErr = (reply: FastifyReply, e: unknown) => {
-    const n = contractErrorName(e instanceof Error ? e.message : '');
-    return err(reply, 422, n ? `contract_${n}` : 'chain_error', n ? `The contract rejected this: ${n}` : 'The network rejected this request.');
-  };
-
   const addr = z.object({ arbiterAddress: z.string().refine((a) => StrKey.isValidEd25519PublicKey(a)) });
   app.post('/admin/disputes/:id/open-onchain', adminOnly(true), async (req, reply) => {
     if (!(await guard(req, reply))) return reply;
@@ -70,7 +61,7 @@ export function registerAdmin(app: FastifyInstance, d: AdminDeps, authed: (mutat
       const xdr = await d.chain.buildOpenDisputeTx(b.data.arbiterAddress, x.bountyId);
       await audit(req, 'dispute.open_onchain.build', `dispute:${x.id}`, { bounty: String(x.bountyId) });
       return { xdr };
-    } catch (e) { return mapErr(reply, e); }
+    } catch (e) { return chainError(reply, e instanceof Error ? e : new Error('')); }
   });
 
   const resolve = z.object({
@@ -95,7 +86,7 @@ export function registerAdmin(app: FastifyInstance, d: AdminDeps, authed: (mutat
       });
       await audit(req, 'dispute.resolve.build', `dispute:${x.id}`, { winner: b.data.winner ?? null, bps: b.data.winnerBps, note: b.data.note });
       return { xdr };
-    } catch (e) { return mapErr(reply, e); }
+    } catch (e) { return chainError(reply, e instanceof Error ? e : new Error('')); }
   });
 
   app.post('/admin/disputes/:id/reject', adminOnly(true), async (req, reply) => {
