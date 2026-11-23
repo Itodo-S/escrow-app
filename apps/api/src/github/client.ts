@@ -131,11 +131,15 @@ export function createGithubClient(cfg: GithubClientConfig) {
       repoOk(repo); positive(issue, 'issue');
       if (!/^bounty: [\w .]{1,40}$/.test(label)) throw new Error('invalid label');
       const existing = await json<{ name: string }[]>(installation, 'GET', `/repos/${repo}/issues/${issue}/labels?per_page=100`);
-      for (const l of existing) {
-        if (l.name.startsWith('bounty:') && l.name !== label) {
-          await call(installation, 'DELETE', `/repos/${repo}/issues/${issue}/labels/${encodeURIComponent(l.name)}`);
-        }
+      const bountyLabels = existing.filter((l) => l.name.startsWith('bounty:'));
+      const hasTarget = bountyLabels.some((l) => l.name === label);
+      // The common case on every chain event: nothing to change, so stop after the single GET.
+      if (bountyLabels.length === 1 && hasTarget) return;
+      for (const l of bountyLabels) {
+        if (l.name !== label) await call(installation, 'DELETE', `/repos/${repo}/issues/${issue}/labels/${encodeURIComponent(l.name)}`);
       }
+      // The issue already carries the label, so the repo label must exist too.
+      if (hasTarget) return;
       const made = await call(installation, 'POST', `/repos/${repo}/labels`, { name: label, color });
       if (!made.ok && made.status !== 422) throw new GithubError(made.status, `create label: ${made.status}`); // 422 = already exists
       await json(installation, 'POST', `/repos/${repo}/issues/${issue}/labels`, { labels: [label] });

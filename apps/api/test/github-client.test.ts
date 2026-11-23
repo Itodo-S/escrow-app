@@ -105,6 +105,18 @@ describe('calls', () => {
     expect(g.calls.some((x) => x.method === 'DELETE' && x.path.endsWith('bounty%3A%2010%20USDC'))).toBe(true);
     expect(g.calls.at(-1)!.body).toEqual({ labels: ['bounty: 50 USDC'] });
   });
+  it('makes no changes when the issue already has exactly the target bounty label', async () => {
+    const g = fakeGithub();
+    g.routes['GET /repos/o/r/readme'] = () => ({ status: 404 });
+    const c = make(g);
+    await c.getReadmeExcerpt(9n, 'o/r'); // cache the installation token
+    g.calls.length = 0;
+    g.routes['GET /repos/o/r/issues/7/labels'] = () => ({ status: 200, json: [{ name: 'bug' }, { name: 'bounty: 50 USDC' }] });
+    await c.setBountyLabel(9n, 'o/r', 7, 'bounty: 50 USDC');
+    expect(g.calls).toHaveLength(1); // only the labels GET
+    expect(g.calls[0]!.method).toBe('GET');
+    expect(g.calls[0]!.path).toContain('/issues/7/labels?per_page=100');
+  });
   it('clears every bounty label from the issue', async () => {
     const g = fakeGithub();
     g.routes['GET /repos/o/r/issues/7/labels'] = () => ({
